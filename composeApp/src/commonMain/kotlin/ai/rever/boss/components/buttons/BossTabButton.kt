@@ -2,7 +2,6 @@ package ai.rever.boss.components.buttons
 
 import ai.rever.boss.components.model.TabDraggableComponent
 import ai.rever.boss.components.model.TabDropResult
-import ai.rever.boss.components.plugin.tab_types.fluck.FluckTabInfo
 import ai.rever.boss.components.overlays.ContextMenu
 import ai.rever.boss.components.overlays.ContextMenuItem
 import ai.rever.boss.components.overlays.OverlayConfig
@@ -10,8 +9,6 @@ import ai.rever.boss.plugin.api.TabIcon
 import ai.rever.boss.plugin.api.TabInfo
 import ai.rever.boss.plugin.ui.BossTheme
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Image
@@ -30,14 +27,12 @@ import androidx.compose.material.Text
 import androidx.compose.material.TextButton
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PushPin
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Diversity2
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
@@ -80,13 +75,6 @@ private const val HOVER_FILL_ALPHA = 0.55f
 
 /** The pin glyph on a pinned tab. Smaller than the close beside it: it is a state, not a button. */
 private val PIN_INDICATOR_SIZE = 10.dp
-
-/**
- * The speaker glyph on a tab that is producing sound (issue #308). One size step above
- * the pin: it has to be findable by scanning a full bar, which is the entire question
- * it exists to answer.
- */
-private val AUDIO_INDICATOR_SIZE = 12.dp
 
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
@@ -447,35 +435,38 @@ fun BossTabButton(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                // Render icon based on type
-                when {
-                    // For bitmap images (favicons), use Image to preserve colors
-                    tabIcon is ai.rever.boss.plugin.api.TabIcon.Image && painter != null -> {
-                        Image(
-                            painter = painter,
-                            contentDescription = fileName,
-                            modifier = Modifier.size(14.dp),
-                        )
-                    }
+                TabAudioIcon(tabInfo?.id, Modifier.size(14.dp)) {
+                    // Render icon based on type
+                    when {
+                        // For bitmap images (favicons), use Image to preserve colors
+                        tabIcon is ai.rever.boss.plugin.api.TabIcon.Image && painter != null -> {
+                            Image(
+                                painter = painter,
+                                contentDescription = fileName,
+                                modifier = Modifier.size(14.dp),
+                            )
+                        }
 
-                    // For vector icons with custom tint (file type icons)
-                    tabIcon is ai.rever.boss.plugin.api.TabIcon.Vector && tabIcon.tint != null && painter != null -> {
-                        val tintColor = tabIcon.tint // Local copy for smart cast
-                        Icon(
-                            painter = painter,
-                            contentDescription = fileName,
-                            modifier = Modifier.size(14.dp),
-                            tint = tintColor!!,
-                        )
-                    }
+                        // For vector icons with custom tint (file type icons)
+                        tabIcon is ai.rever.boss.plugin.api.TabIcon.Vector &&
+                            tabIcon.tint != null && painter != null -> {
+                            val tintColor = tabIcon.tint // Local copy for smart cast
+                            Icon(
+                                painter = painter,
+                                contentDescription = fileName,
+                                modifier = Modifier.size(14.dp),
+                                tint = tintColor!!,
+                            )
+                        }
 
-                    // For vector icons without tint, use default
-                    painter != null -> {
-                        Icon(
-                            painter = painter,
-                            contentDescription = fileName,
-                            modifier = Modifier.size(14.dp),
-                        )
+                        // For vector icons without tint, use default
+                        painter != null -> {
+                            Icon(
+                                painter = painter,
+                                contentDescription = fileName,
+                                modifier = Modifier.size(14.dp),
+                            )
+                        }
                     }
                 }
 
@@ -490,32 +481,6 @@ fun BossTabButton(
                     softWrap = false,
                 )
                 titleBadge?.invoke()
-
-                // Speaker glyph while this tab is producing sound (issue #308), read straight
-                // off tabInfo rather than a parameter: FluckTabInfo carries live playback
-                // state pushed from Chromium's audio events, and leaving this composable's
-                // signature unchanged keeps detekt's signature-keyed baseline entries valid.
-                val isPlayingAudio = (tabInfo as? FluckTabInfo)?.isPlayingAudio == true
-
-                // The alpha animation runs unconditionally - Compose state, cheap at either
-                // target - and the icon only composes while visible, so a silent tab's row
-                // measures exactly what it did before this feature existed.
-                val audioAlpha by animateFloatAsState(
-                    targetValue = if (isPlayingAudio) 1f else 0f,
-                    animationSpec = tween(durationMillis = 200),
-                    label = "audioPlayingIndicator",
-                )
-                if (audioAlpha > 0.01f) {
-                    Icon(
-                        imageVector = Icons.Filled.VolumeUp,
-                        contentDescription = "Playing audio",
-                        tint = colors.signal,
-                        modifier =
-                            Modifier
-                                .size(AUDIO_INDICATOR_SIZE)
-                                .alpha(audioAlpha),
-                    )
-                }
 
                 // Always drawn, unlike the close icon beside it: a tab is pinned whether or not
                 // the pointer is anywhere near it, and an indicator you have to hover to see

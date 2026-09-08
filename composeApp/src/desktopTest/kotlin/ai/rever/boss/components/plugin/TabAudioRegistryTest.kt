@@ -2,73 +2,147 @@ package ai.rever.boss.components.plugin
 
 import kotlin.test.AfterTest
 import kotlin.test.Test
-import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
-/**
- * Pins the contract the tab-bar speaker glyph rests on (issue #308): last-writer-wins per
- * tab id, ownership-checked unregistration, and update reaching only the registered handler.
- * The registry is a global singleton, so these tests use ids unique to this file and clear
- * in tearDown - the same discipline PanelComponentStoreResetTest applies.
- */
 class TabAudioRegistryTest {
-    private val received = mutableListOf<Pair<String, Boolean>>()
+    private val tasks = mutableListOf<() -> Unit>()
+    private val sources = mutableListOf<TabAudioSource>()
 
-    /** A handler that records which tab id it serves and what it was told. */
-    private fun handler(id: String): (Boolean) -> Unit = { playing -> received += id to playing }
+    private fun source(): TabAudioSource = TabAudioSource { tasks.add(it) }.also { sources.add(it) }
+
+    private fun drain() {
+        val pending = tasks.toList()
+        tasks.clear()
+        pending.forEach { it() }
+    }
 
     @AfterTest
-    fun tearDown() {
-        TabAudioRegistry.clear()
+    fun cleanup() {
+        sources.forEach { it.close() }
+        drain()
     }
 
     @Test
-    fun `update reaches the registered handler with the playback state`() {
-        TabAudioRegistry.register("audio-registry-basic", handler("audio-registry-basic"))
-
-        TabAudioRegistry.update("audio-registry-basic", true)
-        TabAudioRegistry.update("audio-registry-basic", false)
-
-        assertEquals(
-            listOf("audio-registry-basic" to true, "audio-registry-basic" to false),
-            received,
-        )
+    fun `playback before ownership is replayed on binding`() {
+        val browser = source()
+        browser.update(true)
+        drain()
+        assertFalse(TabAudioRegistry.isPlaying("late"))
+        browser.bind("late")
+        drain()
+        assertTrue(TabAudioRegistry.isPlaying("late"))
     }
 
     @Test
-    fun `re-registering a tab id replaces the handler`() {
-        val first = handler("first")
-        val second = handler("second")
-        TabAudioRegistry.register("audio-registry-replace", first)
-        TabAudioRegistry.register("audio-registry-replace", second)
-
-        TabAudioRegistry.update("audio-registry-replace", true)
-
-        // The destination panel's handler after adoptTab must be the one that fires, or a
-        // moved tab's glyph updates go to the panel that no longer shows it.
-        assertEquals(listOf("second" to true), received)
+    fun `native callbacks publish only through the UI dispatcher`() {
+        val browser = source()
+        browser.bind("thread")
+        drain()
+        Thread { browser.update(true) }.apply {
+            start()
+            join()
+        }
+        assertFalse(TabAudioRegistry.isPlaying("thread"))
+        drain()
+        assertTrue(TabAudioRegistry.isPlaying("thread"))
     }
 
     @Test
-    fun `unregister is ownership-checked, so a stale handler cannot wipe a newer one`() {
-        val source = handler("source")
-        val destination = handler("destination")
-        TabAudioRegistry.register("audio-registry-ownership", source)
-        TabAudioRegistry.register("audio-registry-ownership", destination)
-
-        // The move sequence: destination registers, then the source panel's close runs.
-        TabAudioRegistry.unregister("audio-registry-ownership", source)
-        TabAudioRegistry.update("audio-registry-ownership", true)
-        assertEquals(listOf("destination" to true), received, "the source's close must not disturb the adoption")
-
-        TabAudioRegistry.unregister("audio-registry-ownership", destination)
-        TabAudioRegistry.update("audio-registry-ownership", false)
-        assertEquals(listOf("destination" to true), received, "and only the owner's unregister removes the entry")
+    fun `late delivery of start cannot undo the latest stop`() {
+        val browser = source()
+        browser.bind("ordering")
+        drain()
+        browser.update(true)
+        browser.update(false)
+        tasks.reverse()
+        drain()
+        assertFalse(TabAudioRegistry.isPlaying("ordering"))
     }
 
     @Test
-    fun `an unknown tab id is a silent no-op`() {
-        TabAudioRegistry.update("never-registered", true)
-        assertTrue(received.isEmpty(), "no handler, no delivery, no throw")
+    fun `initial native state is replayed without an event`() {
+        val browser = source()
+        browser.seed { true }
+        browser.bind("seed")
+        drain()
+        assertTrue(TabAudioRegistry.isPlaying("seed"))
+    }
+
+    @Test
+    fun `event during initial native read wins over stale result`() {
+        val browser = source()
+        browser.bind("seed-race")
+        browser.seed {
+            browser.update(false)
+            true
+        }
+        drain()
+        assertFalse(TabAudioRegistry.isPlaying("seed-race"))
+    }
+
+    @Test
+    fun `replacement browser is immune to old events and disposal`() {
+        val first = source()
+        first.bind("replacement")
+        first.update(true)
+        drain()
+        val second = source()
+        second.bind("replacement")
+        drain()
+        assertFalse(TabAudioRegistry.isPlaying("replacement"), "a silent replacement clears old playback")
+        second.update(true)
+        drain()
+        first.update(false)
+        first.close()
+        drain()
+        assertTrue(TabAudioRegistry.isPlaying("replacement"))
+        second.close()
+        drain()
+        assertFalse(TabAudioRegistry.isPlaying("replacement"))
+    }
+
+    @Test
+    fun `same tab identity keeps playing when its panel changes`() {
+        val browser = source()
+        browser.bind("moving")
+        browser.update(true)
+        drain()
+        browser.bind("moving")
+        drain()
+        assertTrue(TabAudioRegistry.isPlaying("moving"))
+    }
+
+    @Test
+    fun `changing owner releases the previous tab`() {
+        val browser = source()
+        browser.bind("old")
+        browser.update(true)
+        drain()
+        browser.bind("new")
+        drain()
+        assertFalse(TabAudioRegistry.isPlaying("old"))
+        assertTrue(TabAudioRegistry.isPlaying("new"))
+    }
+
+    @Test
+    fun `close invalidates pending binding and late callbacks`() {
+        val browser = source()
+        browser.bind("closed")
+        browser.update(true)
+        browser.close()
+        browser.update(true)
+        browser.bind("resurrected")
+        browser.seed { true }
+        tasks.reverse()
+        drain()
+        assertFalse(TabAudioRegistry.isPlaying("closed"))
+        assertFalse(TabAudioRegistry.isPlaying("resurrected"))
+    }
+
+    @Test
+    fun `unknown and absent tab identities are silent`() {
+        assertFalse(TabAudioRegistry.isPlaying("never-registered"))
+        assertFalse(TabAudioRegistry.isPlaying(null))
     }
 }

@@ -1,64 +1,104 @@
 package ai.rever.boss.components.plugin
 
-import java.util.concurrent.ConcurrentHashMap
+import androidx.compose.runtime.mutableStateMapOf
 
-/**
- * Host-side registry carrying browser audio-playback state into the tab model
- * (issue #308).
- *
- * The speaker glyph on a tab renders from
- * [ai.rever.boss.components.plugin.tab_types.fluck.FluckTabInfo.isPlayingAudio], and the
- * one thing that knows playback started is the browser — owned by the
- * dynamic fluck-browser plugin's tab component, a class the host cannot name
- * (the same reason `ActiveBrowserRegistry` exists). But the plugin DOES tell
- * the host which tab owns each browser (`BrowserHandle.setFullscreenHandler`),
- * so `BrowserHandleImpl` pushes audio events here by tab id, and the owning
- * `BossTabsComponent` — which registered a handler in [register] — updates its
- * tab model the way title/favicon already arrive.
- *
- * Last-writer-wins per tab id, mirroring `TabUpdateRegistry.registerTab`: a tab
- * moved between panels is re-registered by the destination component in
- * `adoptTab`, so the source's stale handler loses the key atomically and the
- * glyph follows the tab. Unregistration is ownership-checked (`remove(k, v)`)
- * so a source panel's close can't wipe a destination's fresh handler.
- *
- * Threading: writes arrive from JxBrowser event threads; handlers are invoked
- * as-is and their bodies must hop to the UI thread (the BossTabsComponent
- * handler mutates snapshot state — see its KDoc).
- */
+/** UI-thread state keyed by stable tab identity, including plugin-defined tab models. */
 object TabAudioRegistry {
-    private val handlers = ConcurrentHashMap<String, (Boolean) -> Unit>()
+    private data class Entry(
+        val owner: Any,
+        val playing: Boolean,
+    )
 
-    /** Register the handler that applies playback state to [tabId]'s tab model. */
-    fun register(
-        tabId: String,
-        handler: (Boolean) -> Unit,
-    ) {
-        handlers[tabId] = handler
-    }
+    private val entries = mutableStateMapOf<String, Entry>()
 
-    /**
-     * Remove [handler] for [tabId]. Atomically a no-op if a move already
-     * re-registered another handler for the same id — the same ownership rule
-     * `TabUpdateRegistry.unregisterTab` applies.
-     */
-    fun unregister(
-        tabId: String,
-        handler: (Boolean) -> Unit,
-    ) {
-        handlers.remove(tabId, handler)
-    }
+    fun isPlaying(tabId: String?): Boolean = entries[tabId]?.playing == true
 
-    /** Push a playback-state change to [tabId]'s registered handler, if any. */
-    fun update(
+    internal fun claim(
         tabId: String,
+        owner: Any,
         playing: Boolean,
     ) {
-        handlers[tabId]?.invoke(playing)
+        entries[tabId] = Entry(owner, playing)
     }
 
-    /** Clear all registrations. Used for testing. */
-    fun clear() {
-        handlers.clear()
+    internal fun update(
+        tabId: String,
+        owner: Any,
+        playing: Boolean,
+    ) {
+        if (entries[tabId]?.owner === owner) entries[tabId] = Entry(owner, playing)
+    }
+
+    internal fun release(
+        tabId: String,
+        owner: Any,
+    ) {
+        if (entries[tabId]?.owner === owner) entries.remove(tabId)
+    }
+}
+
+/**
+ * One browser's playback state. Native callbacks may arrive on any thread; only [dispatch]
+ * publishes snapshot state. The registry retains a token, never a browser or panel callback.
+ * Queued deliveries read the latest level, so close and pause cannot be undone by stale work.
+ */
+internal class TabAudioSource(
+    private val dispatch: (() -> Unit) -> Unit,
+) {
+    private val lock = Any()
+    private val token = Any()
+    private var tabId: String? = null
+    private var publishedId: String? = null
+    private var playing = false
+    private var closed = false
+    private var revision = 0L
+
+    fun bind(id: String) {
+        synchronized(lock) {
+            if (!closed) tabId = id.takeIf { it.isNotEmpty() }
+        }
+        publish()
+    }
+
+    fun update(value: Boolean) {
+        synchronized(lock) {
+            if (!closed) {
+                playing = value
+                revision++
+            }
+        }
+        publish()
+    }
+
+    /** Subscribe first, then seed: an event delivered during the native read wins. */
+    fun seed(read: () -> Boolean) {
+        val before = synchronized(lock) { revision }
+        val value = read()
+        synchronized(lock) {
+            if (!closed && revision == before) playing = value
+        }
+        publish()
+    }
+
+    fun close() {
+        synchronized(lock) {
+            closed = true
+            tabId = null
+        }
+        publish()
+    }
+
+    private fun publish() {
+        dispatch {
+            synchronized(lock) {
+                if (publishedId != tabId) {
+                    publishedId?.let { TabAudioRegistry.release(it, token) }
+                    publishedId = tabId
+                    tabId?.let { TabAudioRegistry.claim(it, token, playing) }
+                } else {
+                    tabId?.let { TabAudioRegistry.update(it, token, playing) }
+                }
+            }
+        }
     }
 }

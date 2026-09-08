@@ -3,7 +3,7 @@ package ai.rever.boss.plugin.browser
 import ai.rever.boss.cache.FaviconCache
 import ai.rever.boss.components.overlays.OverlayCorner
 import ai.rever.boss.components.overlays.overlayCornerIsHeavyweight
-import ai.rever.boss.components.plugin.TabAudioRegistry
+import ai.rever.boss.components.plugin.TabAudioSource
 import ai.rever.boss.components.window_panel.components.main_window_panels.LocalInMainWindowPanel
 import ai.rever.boss.config.AutoPipSettingsManager
 import ai.rever.boss.config.JxBrowserConfig
@@ -359,14 +359,10 @@ internal class BrowserHandleImpl(
     private val faviconListeners = CopyOnWriteArrayList<(String?) -> Unit>()
     private val loadingListeners = CopyOnWriteArrayList<(Boolean) -> Unit>()
     private val zoomListeners = CopyOnWriteArrayList<(Double) -> Unit>()
-    private val audioPlayingListeners = CopyOnWriteArrayList<(Boolean) -> Unit>()
+    private val audioSource = TabAudioSource { SwingUtilities.invokeLater(it) }
 
     // Track loading state
     private var _isLoading = false
-
-    // Last playback state Chromium reported, replayed to late-registered listeners the
-    // way lastKnownTitle/_isLoading are (issue #308).
-    @Volatile private var _isPlayingAudio = false
 
     // Context menu callback. Volatile because it is set from the UI thread and read from a
     // JxBrowser callback thread; a stale null read there means no menu at all.
@@ -1395,18 +1391,17 @@ internal class BrowserHandleImpl(
         // shape mismatch must degrade to "no indicator", not to a dead browser.
         runCatching {
             val audio = browser.audio()
-            _isPlayingAudio = audio.isPlaying()
             subscriptions +=
                 audio.on(AudioStartedPlaying::class.java) { _ ->
-                    _isPlayingAudio = true
-                    notifyAudioPlaying(true)
+                    audioSource.update(true)
                 }
             subscriptions +=
                 audio.on(AudioStoppedPlaying::class.java) { _ ->
-                    _isPlayingAudio = false
-                    notifyAudioPlaying(false)
+                    audioSource.update(false)
                 }
+            audioSource.seed { audio.isPlaying() }
         }.onFailure {
+            audioSource.close()
             logger.warn(LogCategory.BROWSER, "Audio playback subscription unavailable", error = it)
         }
 
@@ -1426,12 +1421,14 @@ internal class BrowserHandleImpl(
                     mapOf("handleId" to id, "exitCode" to event.exitCode(), "status" to event.status().name),
                 )
                 rendererPid.onGone()
+                audioSource.update(false)
             }
 
         // Browser closed
         subscriptions +=
             browser.on(BrowserClosed::class.java) {
                 logger.debug(LogCategory.BROWSER, "Browser closed", mapOf("handleId" to id))
+                audioSource.close()
                 disposed.set(true)
                 rendererPid.onGone()
                 // Stop streaming: the underlying page is gone.
@@ -2748,51 +2745,6 @@ internal class BrowserHandleImpl(
     }
 
     // ============================================================
-    // AUDIO PLAYBACK STATE
-    // ============================================================
-
-    override fun isPlayingAudio(): Boolean = _isPlayingAudio
-
-    override fun addAudioPlayingListener(listener: (Boolean) -> Unit) {
-        audioPlayingListeners.add(listener)
-        // Same replay, same reason as addLoadingListener: a listener attached while a
-        // video is already playing would otherwise sit at "silent" until the next start
-        // event. No blank case - both values are real answers.
-        runCatching { listener(_isPlayingAudio) }
-            .onFailure { logger.warn(LogCategory.BROWSER, "Audio listener threw on replay", error = it) }
-    }
-
-    override fun removeAudioPlayingListener(listener: (Boolean) -> Unit) {
-        audioPlayingListeners.remove(listener)
-    }
-
-    /**
-     * Fire the audio listeners and carry the state into the tab model.
-     *
-     * The second half is what makes the tab-bar glyph work end to end: the fluck-browser
-     * tab component is a dynamic plugin's class, so the host cannot register a listener
-     * with it - but the plugin DOES tell the host which tab owns this browser
-     * (via [setFullscreenHandler], the same channel Back-to-tab uses). That id reaches
-     * [TabAudioRegistry], where the owning BossTabsComponent picked up the handler in
-     * addTab, so the flag lands in FluckTabInfo the way title/favicon already do.
-     */
-    private fun notifyAudioPlaying(playing: Boolean) {
-        audioPlayingListeners.forEach { listener ->
-            try {
-                listener(playing)
-            } catch (e: Exception) {
-                logger.warn(LogCategory.BROWSER, "Audio listener threw exception", error = e)
-            }
-        }
-        // Marshalled to the EDT: the registry's handler mutates snapshot state the tab model
-        // owns, which is UI-thread-only (review of this PR). The listeners above stay on the
-        // JxBrowser event thread - replay-on-subscribe must not reorder against live events.
-        ownerTabId?.let { tabId ->
-            SwingUtilities.invokeLater { TabAudioRegistry.update(tabId, playing) }
-        }
-    }
-
-    // ============================================================
     // SECURITY
     // ============================================================
 
@@ -3643,11 +3595,7 @@ internal class BrowserHandleImpl(
         // plugin's component type, which host code cannot name.
         ownerTabId = tabId
 
-        // If audio started before the plugin told us which tab owns this browser, the start
-        // event fired against a null owner and nothing was registered to replay it. Flush the
-        // current playback state now that the id is known, so the glyph appears at
-        // registration instead of never (review of this PR, open question).
-        if (_isPlayingAudio) notifyAudioPlaying(true)
+        audioSource.bind(tabId)
 
         FluckEngine.setupFullscreenHandler(
             browser = browser,
@@ -4302,6 +4250,7 @@ internal class BrowserHandleImpl(
     }
 
     override fun dispose() {
+        audioSource.close()
         // Synchronously, and before the guard below: invokeLater would let browser.close() run
         // first, and closing the browser under a still-attached Swing view is exactly the
         // ordering that leaves an undecorated always-on-top window on screen with nothing able

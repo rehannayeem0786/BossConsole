@@ -1,5 +1,6 @@
 package ai.rever.boss.components.dialogs
 
+import ai.rever.boss.components.buttons.TabAudioIcon
 import ai.rever.boss.components.common.rememberFaviconLoader
 import ai.rever.boss.components.plugin.tab_types.fluck.FluckTabInfo
 import ai.rever.boss.components.window_panel.SplitViewState
@@ -20,7 +21,6 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.*
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Tab
@@ -303,29 +303,31 @@ private fun ActiveTabDialogItem(
                     .padding(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Display favicon if available, otherwise fallback icon
-            loadedFavicon?.let { favicon ->
-                // Display actual favicon (safe call, no !!)
-                Image(
-                    painter = favicon.asPainter(),
-                    contentDescription = "Tab icon",
-                    modifier = Modifier.size(16.dp),
-                )
-            } ?: run {
-                // Fallback to appropriate vector icon based on tab type
-                val fallbackIcon =
-                    when (activeTab.tabInfo) {
-                        is FluckTabInfo -> Icons.Outlined.Language
+            TabAudioIcon(activeTab.tabInfo.id, Modifier.size(16.dp)) {
+                // Display favicon if available, otherwise fallback icon
+                loadedFavicon?.let { favicon ->
+                    // Display actual favicon (safe call, no !!)
+                    Image(
+                        painter = favicon.asPainter(),
+                        contentDescription = "Tab icon",
+                        modifier = Modifier.size(16.dp),
+                    )
+                } ?: run {
+                    // Fallback to appropriate vector icon based on tab type
+                    val fallbackIcon =
+                        when (activeTab.tabInfo) {
+                            is FluckTabInfo -> Icons.Outlined.Language
 
-                        // Browser tabs
-                        else -> Icons.Outlined.Tab // Other tab types
-                    }
-                Icon(
-                    fallbackIcon,
-                    contentDescription = "Tab icon",
-                    tint = if (isSelected) BossTheme.colors.textPrimary else BossTheme.colors.textSecondary,
-                    modifier = Modifier.size(16.dp),
-                )
+                            // Browser tabs
+                            else -> Icons.Outlined.Tab // Other tab types
+                        }
+                    Icon(
+                        fallbackIcon,
+                        contentDescription = "Tab icon",
+                        tint = if (isSelected) BossTheme.colors.textPrimary else BossTheme.colors.textSecondary,
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.width(12.dp))
@@ -364,19 +366,6 @@ private fun ActiveTabDialogItem(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-            }
-
-            // Speaker glyph for a tab that is currently producing sound (issue #308), read
-            // straight off the live tab model. TopOfMindDialog refreshes its list every
-            // second, so start/stop land here within a poll of the event that caused them.
-            if ((activeTab.tabInfo as? FluckTabInfo)?.isPlayingAudio == true) {
-                Icon(
-                    imageVector = Icons.Filled.VolumeUp,
-                    contentDescription = "Playing audio",
-                    tint = BossTheme.colors.signal,
-                    modifier = Modifier.size(14.dp),
-                )
-                Spacer(modifier = Modifier.width(8.dp))
             }
 
             Spacer(modifier = Modifier.width(8.dp))
