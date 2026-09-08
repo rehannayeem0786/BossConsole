@@ -2272,13 +2272,12 @@ class BossTabsComponent(
     ) {
         val tabs = tabsState.value.tabs
         val index = tabs.indexOfFirst { it.id == tabId }
-        if (index < 0) return
-        val current = tabs[index] as? FluckTabInfo ?: return
-        // Skip identical pushes: AudioStartedPlaying/StoppedPlaying are edge events,
-        // but the replay on listener registration is a level, and a redundant
-        // updateTab would invalidate Compose for no visual change.
-        if (current.isPlayingAudio == playing) return
-        updateTab(index, current.updateAudioPlaying(playing))
+        val current = index.takeIf { it >= 0 }?.let { tabs[it] } as? FluckTabInfo
+        // Skip identical pushes (the listener replay is a level, not an edge) and stale
+        // lookups: a redundant updateTab would invalidate Compose for no visual change.
+        if (current != null && current.isPlayingAudio != playing) {
+            updateTab(index, current.updateAudioPlaying(playing))
+        }
     }
 
     // Get active tab component
