@@ -199,7 +199,9 @@ class BrowserClipboardCommandsTest {
     /** A [Transferable] with no data: identity is the only thing these tests ask of it. */
     private class FakeTransferable : Transferable {
         override fun getTransferData(flavor: DataFlavor): Any = Any()
+
         override fun getTransferDataFlavors(): Array<DataFlavor> = emptyArray()
+
         override fun isDataFlavorSupported(flavor: DataFlavor): Boolean = false
     }
 
