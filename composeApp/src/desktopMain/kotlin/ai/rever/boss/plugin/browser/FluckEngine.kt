@@ -50,14 +50,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * Clipboard bookkeeping for paste-without-formatting (issue #205). One session for the
- * process: the system clipboard is JVM-wide, so two presses in different tabs within the
- * restore window are still one round trip and must settle together. See
- * [PasteWithoutFormattingSession] for why the restore is identity-based rather than
- * text-based - the text projection alone cannot tell "our write is still on the clipboard"
- * from "a previous press already restored the rich original".
- */
+/** Process-wide because native clipboard state is shared by all browser tabs. */
 private val pasteWithoutFormattingSession =
     PasteWithoutFormattingSession(
         currentContents = { Toolkit.getDefaultToolkit().systemClipboard.getContents(null) },
@@ -3112,49 +3105,13 @@ object FluckEngine {
                                 // 3. Dispatch synthetic Cmd+V via JxBrowser API (triggers native paste)
                                 // 4. Restore original clipboard after delay
                                 try {
-                                    val clipboard = Toolkit.getDefaultToolkit().systemClipboard
-                                    val plainText = clipboard.getData(java.awt.datatransfer.DataFlavor.stringFlavor) as? String
-                                    if (plainText != null) {
-                                        // Install the plain-text-only version and record the exact
-                                        // instance for the deferred restore. Identity, not text:
-                                        // "our write is still there" and "a previous press already
-                                        // restored the rich original" share a string projection, and
-                                        // only the instance tells them apart (review of this PR,
-                                        // re: #205's double-press downgrade).
-                                        val written = java.awt.datatransfer.StringSelection(plainText)
-                                        pasteWithoutFormattingSession.registerWrite(written)
-                                        clipboard.setContents(written, null)
-                                        // Dispatch Cmd+V (or Ctrl+V) as a native key event to trigger paste
-                                        val pasteModifiers =
-                                            com.teamdev.jxbrowser.ui.KeyModifiers
-                                                .newBuilder()
-                                                .apply {
-                                                    if (SystemUtils.isMacOS) metaDown(true) else controlDown(true)
-                                                }.build()
-                                        browser.dispatch(
-                                            com.teamdev.jxbrowser.ui.event.KeyPressed
-                                                .newBuilder(
-                                                    com.teamdev.jxbrowser.ui.KeyCode.KEY_CODE_V,
-                                                ).keyModifiers(pasteModifiers)
-                                                .build(),
-                                        )
-                                        browser.dispatch(
-                                            com.teamdev.jxbrowser.ui.event.KeyReleased
-                                                .newBuilder(
-                                                    com.teamdev.jxbrowser.ui.KeyCode.KEY_CODE_V,
-                                                ).keyModifiers(pasteModifiers)
-                                                .build(),
-                                        )
-                                        // Restore after paste completes. Fires only while the
-                                        // clipboard still holds one of this window's writes, and
-                                        // puts back the content that preceded the FIRST of them -
-                                        // so a user copy in the window wins, and a burst of
-                                        // presses converges on the rich original instead of
-                                        // downgrading it to the last press's plain text.
+                                    val restoreTicket = pasteWithoutFormattingSession.beginPaste()
+                                    if (restoreTicket != null) {
+                                        // Arm cleanup before dispatch, which can throw when the browser closes.
                                         CoroutineScope(Dispatchers.IO).launch {
                                             delay(200)
                                             try {
-                                                if (!pasteWithoutFormattingSession.tryRestore()) {
+                                                if (!pasteWithoutFormattingSession.tryRestore(restoreTicket)) {
                                                     // The clipboard changed hands mid-window, or
                                                     // every write already restored. Debug, not
                                                     // info: happy path, and a line per keystroke
@@ -3177,12 +3134,33 @@ object FluckEngine {
                                                 )
                                             }
                                         }
+                                        // Dispatch Cmd+V (or Ctrl+V) as a native key event to trigger paste
+                                        val pasteModifiers =
+                                            com.teamdev.jxbrowser.ui.KeyModifiers
+                                                .newBuilder()
+                                                .apply {
+                                                    if (SystemUtils.isMacOS) metaDown(true) else controlDown(true)
+                                                }.build()
+                                        browser.dispatch(
+                                            com.teamdev.jxbrowser.ui.event.KeyPressed
+                                                .newBuilder(
+                                                    com.teamdev.jxbrowser.ui.KeyCode.KEY_CODE_V,
+                                                ).keyModifiers(pasteModifiers)
+                                                .build(),
+                                        )
+                                        browser.dispatch(
+                                            com.teamdev.jxbrowser.ui.event.KeyReleased
+                                                .newBuilder(
+                                                    com.teamdev.jxbrowser.ui.KeyCode.KEY_CODE_V,
+                                                ).keyModifiers(pasteModifiers)
+                                                .build(),
+                                        )
                                     }
                                 } catch (e: Exception) {
                                     logger.debug(
                                         LogCategory.BROWSER,
                                         "Paste without formatting failed",
-                                        mapOf("error" to (e.message ?: "unknown")),
+                                        mapOf("error" to (e::class.simpleName ?: "unknown")),
                                     )
                                 }
                                 return@PressKeyCallback com.teamdev.jxbrowser.browser.callback.input.PressKeyCallback.Response

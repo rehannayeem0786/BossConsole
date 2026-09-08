@@ -1,82 +1,97 @@
 package ai.rever.boss.plugin.browser
 
+import java.awt.datatransfer.DataFlavor
+import java.awt.datatransfer.StringSelection
 import java.awt.datatransfer.Transferable
+import java.awt.datatransfer.UnsupportedFlavorException
 
 /**
- * Bookkeeping for paste-without-formatting's clipboard round trip (issue #205).
+ * One process-wide clipboard round trip for paste without formatting (#205).
  *
- * The shortcut overwrites the system clipboard with plain text, lets Chromium paste, and
- * restores the original content a moment later. The restore is the dangerous half. An
- * unconditional timer-based restore clobbers anything the user copies in the window. And a
- * naive string-equality guard cannot distinguish "our plain text is still on the clipboard"
- * from "a previous press already restored the rich original" - whose own string projection
- * is, by construction, the very same text. That second state is what made two rapid presses
- * permanently downgrade a rich clipboard to plain text: the second press's "original" is the
- * first press's plain write, so once the first restore landed, the second restore's guard
- * matched again and put plain text back over it.
+ * AWT's system clipboard wraps installed Transferables, so their object identity is not an
+ * ownership signal. A JVM-local marker survives that wrapper without being pasted as text.
+ * Each write gets a new marker; only its own timer can restore it. Consecutive owned writes
+ * retain the first rich original, but a foreign copy starts a fresh round trip even if its
+ * text is identical. Clipboard access failures retire the pending restore rather than letting
+ * a later paste resurrect stale content.
  *
- * The fix is identity, not text. Every press registers the exact [Transferable] it installed,
- * and a restore fires only while the clipboard's CURRENT contents is one of those instances
- * (AWT hands back the same instance it was given, until someone replaces it). A restore puts
- * back the content that preceded the FIRST outstanding write of the window, so a burst of
- * presses converges on the rich original rather than on the last press's plain text. A user
- * copy in the window is a foreign Transferable, so it wins and the whole session retires.
- *
- * This also settles why not AWT's `lostOwnership`: that callback fires on ANY replacement,
- * including our own second press's write - which would cancel the first press's restore and
- * reintroduce the downgrade. Identity checked at restore time gives the precise signal.
- *
- * Pure given its suppliers: the clipboard's current contents is read through
- * [currentContents] and the restore installed through [install], so tests run with fake
- * Transferables and no AWT clipboard at all. All state is guarded by [this]; the pending map
- * empties on every exit path (restore hit, foreign content, nothing pending), so a burst
- * holds nothing afterwards. Residual race: a write landing between [tryRestore]'s read and
- * install is microseconds wide and best-effort by design - the old code exposed an
- * unconditional 200ms one.
+ * Access through this session is serialized. AWT offers no atomic compare-and-set against
+ * other processes: a native copy between the final ownership read and restore can still win
+ * or lose. The 200ms consumption delay remains a heuristic, not a Chromium acknowledgment.
+ * Tests inject clipboard suppliers and never access the user's system clipboard.
  */
 internal class PasteWithoutFormattingSession(
     private val currentContents: () -> Transferable?,
     private val install: (Transferable) -> Unit,
 ) {
-    // written -> the content to put back for it. Identity-keyed on purpose: StringSelection
-    // has no value equality, and two presses writing the same text must stay distinct.
-    private val pending = LinkedHashMap<Transferable, Transferable>()
-    private var windowOriginal: Transferable? = null
+    private data class Pending(
+        val ticket: Any,
+        val original: Transferable,
+    )
 
-    /**
-     * Record that [written] is about to be installed as this press's plain-text clipboard.
-     * The first outstanding write of a window also captures the content to restore to;
-     * later writes in the same window inherit it, which is what keeps a burst converging
-     * on the rich original instead of on the previous press's plain text.
-     */
-    fun registerWrite(written: Transferable) {
-        synchronized(this) {
-            if (windowOriginal == null) windowOriginal = currentContents() ?: written
-            pending[written] = windowOriginal ?: written
+    private var pending: Pending? = null
+
+    /** Installs plain text and returns the opaque ticket for that write's deferred restore. */
+    @Synchronized
+    fun beginPaste(): Any? {
+        val previous = pending
+        pending = null
+        val current = currentContents() ?: return null
+        val text =
+            if (current.isDataFlavorSupported(DataFlavor.stringFlavor)) {
+                current.getTransferData(DataFlavor.stringFlavor) as? String
+            } else {
+                null
+            }
+        return if (text != null) {
+            val original =
+                if (previous != null && marker(current) === previous.ticket) previous.original else current
+            val ticket = Any()
+            install(PlainTextWithMarker(text, ticket))
+            pending = Pending(ticket, original)
+            ticket
+        } else {
+            null
         }
     }
 
-    /**
-     * Attempt the deferred restore. Returns true when it installed anything, false when the
-     * clipboard had already moved on - a user copy, another application, or every write
-     * already restored - in which case the session retires and later presses start fresh.
-     */
-    fun tryRestore(): Boolean {
-        synchronized(this) {
-            val target = windowOriginal
-            val current = if (pending.isNotEmpty() && target != null) currentContents() else null
-            if (target != null && current != null && pending.keys.any { it === current }) {
-                // Retire the window as restored: the next press starts fresh, and nothing
-                // about this burst outlives its own restore.
-                pending.clear()
-                windowOriginal = null
-                install(target)
-                return true
-            }
-            // Foreign content or nothing pending - retire without installing anything.
-            pending.clear()
-            windowOriginal = null
-            return false
+    /** Stale timers cannot retire a newer write, even after a foreign copy or an earlier restore. */
+    @Synchronized
+    fun tryRestore(ticket: Any): Boolean {
+        val active = pending?.takeIf { it.ticket === ticket } ?: return false
+        pending = null
+        val current = currentContents()
+        return if (current != null && marker(current) === ticket) {
+            install(active.original)
+            true
+        } else {
+            false
         }
+    }
+
+    private fun marker(contents: Transferable): Any? =
+        if (contents.isDataFlavorSupported(MARKER_FLAVOR)) contents.getTransferData(MARKER_FLAVOR) else null
+
+    private class PlainTextWithMarker(
+        text: String,
+        private val ticket: Any,
+    ) : Transferable {
+        private val plain = StringSelection(text)
+
+        override fun getTransferDataFlavors(): Array<DataFlavor> = plain.transferDataFlavors + MARKER_FLAVOR
+
+        override fun isDataFlavorSupported(flavor: DataFlavor): Boolean = flavor in transferDataFlavors
+
+        override fun getTransferData(flavor: DataFlavor): Any =
+            when {
+                flavor == MARKER_FLAVOR -> ticket
+                plain.isDataFlavorSupported(flavor) -> plain.getTransferData(flavor)
+                else -> throw UnsupportedFlavorException(flavor)
+            }
+    }
+
+    private companion object {
+        val MARKER_FLAVOR =
+            DataFlavor("${DataFlavor.javaJVMLocalObjectMimeType};class=java.lang.Object", "BOSS plain paste")
     }
 }

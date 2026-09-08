@@ -1,32 +1,45 @@
 package ai.rever.boss.plugin.browser
 
+import java.awt.datatransfer.StringSelection
+import java.awt.datatransfer.Transferable
 import kotlin.test.Test
 import kotlin.test.assertFalse
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
-/**
- * BossConsole#205: `FluckEngine`'s Cmd+Shift+V ("paste without formatting") restores the
- * pre-paste clipboard after a fixed 200ms delay. That restore used to be unconditional, so
- * anything the user copied during the window was silently replaced with no signal - a Cmd+C
- * landing there was simply lost. [FluckEngine.shouldRestoreClipboardAfterPaste] is the fix:
- * restore only when the clipboard still holds exactly the plain text this code wrote, so a copy
- * that happened in the meantime wins instead of being clobbered.
- */
+/** Scenarios retained from Antriksh's #408, adapted to the shared session's ownership guard. */
 class ClipboardRestoreAfterPasteTest {
     @Test
     fun `restores when nothing else was copied in the meantime`() {
-        assertTrue(FluckEngine.shouldRestoreClipboardAfterPaste("hello world", "hello world"))
+        val original = StringSelection("hello world")
+        var contents: Transferable? = original
+        val session = PasteWithoutFormattingSession({ contents }, { contents = it })
+        val ticket = checkNotNull(session.beginPaste())
+
+        assertTrue(session.tryRestore(ticket))
+        assertSame(original, contents)
     }
 
     @Test
     fun `does not restore when the user copied something else during the window`() {
-        // The exact race #205 reports: a Cmd+C landing in the 200ms window used to be silently
-        // overwritten by the restore.
-        assertFalse(FluckEngine.shouldRestoreClipboardAfterPaste("something the user just copied", "hello world"))
+        var contents: Transferable? = StringSelection("hello world")
+        val session = PasteWithoutFormattingSession({ contents }, { contents = it })
+        val ticket = checkNotNull(session.beginPaste())
+        val copy = StringSelection("something the user just copied")
+        contents = copy
+
+        assertFalse(session.tryRestore(ticket))
+        assertSame(copy, contents)
     }
 
     @Test
     fun `does not restore when the clipboard was cleared in the meantime`() {
-        assertFalse(FluckEngine.shouldRestoreClipboardAfterPaste(null, "hello world"))
+        var contents: Transferable? = StringSelection("hello world")
+        val session = PasteWithoutFormattingSession({ contents }, { contents = it })
+        val ticket = checkNotNull(session.beginPaste())
+        contents = null
+
+        assertFalse(session.tryRestore(ticket))
+        assertSame(null, contents)
     }
 }

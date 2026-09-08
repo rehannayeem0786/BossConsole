@@ -196,13 +196,13 @@ class BrowserClipboardCommandsTest {
 
     // --- paste-without-formatting's clipboard restore (issue #205) ---
 
-    /** A [Transferable] with no data: identity is the only thing these tests ask of it. */
+    /** A rich-content stand-in distinct from the plain substitution even when its text matches. */
     private class FakeTransferable : Transferable {
-        override fun getTransferData(flavor: DataFlavor): Any = Any()
+        override fun getTransferData(flavor: DataFlavor): Any = "same text"
 
-        override fun getTransferDataFlavors(): Array<DataFlavor> = emptyArray()
+        override fun getTransferDataFlavors(): Array<DataFlavor> = arrayOf(DataFlavor.stringFlavor)
 
-        override fun isDataFlavorSupported(flavor: DataFlavor): Boolean = false
+        override fun isDataFlavorSupported(flavor: DataFlavor): Boolean = flavor == DataFlavor.stringFlavor
     }
 
     /** A stand-in clipboard: [PasteWithoutFormattingSession] reads and installs through it. */
@@ -231,11 +231,9 @@ class BrowserClipboardCommandsTest {
         clip.contents = rich
         val session = clip.session()
 
-        val written = FakeTransferable()
-        session.registerWrite(written)
-        clip.contents = written
+        val written = checkNotNull(session.beginPaste())
 
-        assertTrue(session.tryRestore(), "the deferred restore must fire while our write is still current")
+        assertTrue(session.tryRestore(written), "the deferred restore must fire while our write is still current")
         assertSame(rich, clip.contents, "the restore puts back the content captured before the write")
     }
 
@@ -250,17 +248,15 @@ class BrowserClipboardCommandsTest {
         clip.contents = FakeTransferable()
         val session = clip.session()
 
-        val written = FakeTransferable()
-        session.registerWrite(written)
-        clip.contents = written
+        val written = checkNotNull(session.beginPaste())
 
         val userCopy = FakeTransferable()
         clip.contents = userCopy
 
-        assertFalse(session.tryRestore(), "a foreign Transferable must not be replaced")
+        assertFalse(session.tryRestore(written), "a foreign Transferable must not be replaced")
         assertSame(userCopy, clip.contents, "the user's copy survives")
-        assertFalse(session.tryRestore(), "a retired session must not fire again")
-        assertEquals(0, clip.installed.size)
+        assertFalse(session.tryRestore(written), "a retired session must not fire again")
+        assertEquals(1, clip.installed.size)
     }
 
     /**
@@ -279,18 +275,14 @@ class BrowserClipboardCommandsTest {
         // makes a two-tab burst a single round trip.
         val session = clip.session()
 
-        val firstWrite = FakeTransferable()
-        session.registerWrite(firstWrite)
-        clip.contents = firstWrite
+        val firstWrite = checkNotNull(session.beginPaste())
 
-        val secondWrite = FakeTransferable()
-        session.registerWrite(secondWrite)
-        clip.contents = secondWrite
+        val secondWrite = checkNotNull(session.beginPaste())
 
-        assertTrue(session.tryRestore(), "the first restore to fire still sees one of our writes")
+        assertTrue(session.tryRestore(secondWrite), "the latest write restores the original")
         assertSame(rich, clip.contents, "the restore targets the pre-window original, not the previous write")
-        assertFalse(session.tryRestore(), "and the second press's deferred restore must not run after it")
-        assertEquals(1, clip.installed.size, "exactly one install for the whole burst")
+        assertFalse(session.tryRestore(firstWrite), "and an earlier timer must not restore again")
+        assertEquals(3, clip.installed.size, "two plain writes and exactly one restore for the burst")
     }
 
     /** A session with no outstanding write is inert: no read of the clipboard, no install. */
@@ -299,7 +291,7 @@ class BrowserClipboardCommandsTest {
         val clip = FakeClipboard()
         clip.contents = FakeTransferable()
 
-        assertFalse(clip.session().tryRestore())
+        assertFalse(clip.session().tryRestore(Any()))
         assertEquals(0, clip.installed.size)
     }
 
@@ -316,17 +308,13 @@ class BrowserClipboardCommandsTest {
         clip.contents = rich
         val session = clip.session()
 
-        val first = FakeTransferable()
-        session.registerWrite(first)
-        clip.contents = first
-        session.tryRestore()
+        val first = checkNotNull(session.beginPaste())
+        session.tryRestore(first)
         assertSame(rich, clip.contents)
 
-        val second = FakeTransferable()
-        session.registerWrite(second)
-        clip.contents = second
-        session.tryRestore()
+        val second = checkNotNull(session.beginPaste())
+        session.tryRestore(second)
         assertSame(rich, clip.contents, "each press restores what it displaced")
-        assertEquals(2, clip.installed.size)
+        assertEquals(4, clip.installed.size)
     }
 }
